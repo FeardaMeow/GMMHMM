@@ -137,15 +137,13 @@ class gmmhmm:
                 beta[:,t] /= np.sum(beta[:, t])
         return(beta)
 
-    def _slide_step(self, obs, alpha_old, beta_old, gamma_old):
+    def _slide_step(self, obs, alpha_old, beta_old, gamma_old, obs_old):
         B = self._norm_likelihood(obs)
         alpha = self._slide_forward(B)
         beta = self._slide_backward(B)
         
         gamma =  alpha*beta #nxT
         gamma /= np.sum(gamma,axis=0)
-        
-        
         
         expected_mu = np.zeros((self.n_dims, self.n_states))
         expected_covs = np.zeros((self.n_dims, self.n_dims, self.n_states))
@@ -154,28 +152,29 @@ class gmmhmm:
         #Set zeros to 1 before dividing
         gamma_state_sum = gamma_state_sum + (gamma_state_sum == 0)
         
+        gamma_old_sum = np.sum(gamma_old[obs.shape[1]:], axis=1)
+        
+        xi = np.zeros([self.n_states,self.n_states])
         for t in range(obs.shape[1]):
             if (t==0):
-                xi =  self.A * np.dot(alpha_old, (beta[:, t] * B[:, t]).T)
-                xi = self._norm(xi)
-                gamma_old_sum = np.sum(gamma_old, axis=1)
-                gamma_sum = np.sum(np.concatenate((gamma_old[:,t+1:gamma_old.shape[1]],gamma[:,0:t+1]),axis=1),axis=1)
-                self.A = ((gamma_old_sum/gamma_sum)*self.A.T).T + (xi.T/gamma_sum).T
+                partial_sum =  self.A * np.dot(alpha_old, (beta[:, t] * B[:, t]).T)
+                xi += self._norm(partial_sum)
             else:
-                xi = self.A * np.dot(alpha[:, t], (beta[:, t] * B[:, t]).T)
-                xi = self._norm(xi)
-                gamma_old_sum = np.sum(gamma_old, axis=1)
-                gamma_sum = np.sum(np.concatenate((gamma_old[:,t+1:gamma_old.shape[1]],gamma[:,0:t+1]),axis=1),axis=1)
-                self.A = ((gamma_old_sum/gamma_sum)*self.A.T).T + (xi.T/gamma_sum).T
-
+                partial_sum = self.A * np.dot(alpha[:, t], (beta[:, t] * B[:, t]).T)
+                xi += self._norm(partial_sum)
+                
         for s in range(self.n_states):
             gamma_obs = obs * gamma[s, :] #1xT
             expected_mu[:, s] = np.sum(gamma_obs, axis=1) / gamma_state_sum[s]
             partial_covs = np.dot(gamma_obs, obs.T) / gamma_state_sum[s] - np.dot(expected_mu[:, s], expected_mu[:, s].T)
             #Symmetrize
             expected_covs[:,:,s] = np.triu(partial_covs) + np.triu(partial_covs).T - np.diag(partial_covs)
-                
-        return(np.concatenate((gamma_old[:,gamma.shape[1]:gamma_old.shape[1]],gamma),axis=1))
+        
+        self.A = self.A*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + self._rownorm((xi.T/(gamma_old_sum+gamma_state_sum)).T)
+        self.mu = self.mu*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + expected_mu/(gamma_old_sum+gamma_state_sum)
+        self.covs = self.covs*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + expected_covs/(gamma_old_sum+gamma_state_sum)[:,None]
+        
+        return(np.concatenate((gamma_old[:,gamma.shape[1]:],gamma),axis=1))
         
         
 #Set seed
