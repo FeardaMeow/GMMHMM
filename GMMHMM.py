@@ -1,5 +1,6 @@
 import scipy.stats as st
 import numpy as np
+from numpy import linalg as la
 
 class gmmhmm:
     
@@ -28,7 +29,7 @@ class gmmhmm:
         return B
     
     #method = em, slide
-    def train(self, obs, A=None, mu=None, covs=None, n_iter=30, method='em'):
+    def train(self, obs, A=None, mu=None, covs=None, n_iter=30, method='em', slide_win = 20, train_win=50000, obs_win=300):
         # obs = (number of featres, time)
         obs = np.atleast_2d(obs)
         if (A is not None):
@@ -44,8 +45,21 @@ class gmmhmm:
         if method == 'em':
             #Call EM function
             for n in range(n_iter):
-                self._em_step(obs)
-    
+                error = self._em_step(obs, obs_win, method)
+                if (error <= 1e-5):
+                    break
+        elif method == 'slide':
+            for n in range(n_iter):
+                alpha_old, beta_old, gamma_old, error = self._em_step(obs[:,:train_win], obs_win, method)
+                if (error <= 1e-5):
+                    break
+            print(self.A, self.mu, self.covs)
+            num_loop = int(obs[:,train_win:].shape[1]/slide_win)
+            for n in range(num_loop):
+                alpha_old, beta_old, gamma_old = self._slide_step(obs[:,(train_win+slide_win*n):(train_win+slide_win*(n+1))], alpha_old, beta_old, gamma_old) 
+                if (n%100==0):
+                    print(self.A)
+                
     def _train_init(self, obs):
         #Initializes the starting point for the parameters
         if self.n_dims is None:
@@ -77,7 +91,8 @@ class gmmhmm:
             beta[:, t] /= np.sum(beta[:, t])
         return(beta)
     
-    def _em_step(self, obs):
+    def _em_step(self, obs, obs_win, method):
+        oldA = self.A
         B = self._norm_likelihood(obs)
         alpha = self._forward(B)
         beta = self._backward(B)
@@ -110,9 +125,13 @@ class gmmhmm:
         expected_covs += .01 * np.eye(self.n_dims)[:, :, None]
         
         
-        self.A = self._rownorm(xi.T/np.sum(gamma,axis=1))
+        self.A = self._rownorm((xi.T/np.sum(gamma,axis=1)).T)
         self.mu = expected_mu
         self.covs = expected_covs
+        if method == 'em':
+            return(la.norm(self.A-oldA))
+        else:
+            return(alpha[:,-1], beta[:,-1], gamma[:,-obs_win:], la.norm(self.A-oldA))
 
     def _slide_forward(self, B, alpha_old):
         alpha = np.zeros(B.shape) # nxT
@@ -137,31 +156,28 @@ class gmmhmm:
                 beta[:,t] /= np.sum(beta[:, t])
         return(beta)
 
-    def _slide_step(self, obs, alpha_old, beta_old, gamma_old, obs_old):
+    def _slide_step(self, obs, alpha_old, beta_old, gamma_old):
         B = self._norm_likelihood(obs)
-        alpha = self._slide_forward(B)
-        beta = self._slide_backward(B)
+        alpha = self._slide_forward(B, alpha_old)
+        beta = self._slide_backward(B, beta_old)
         
         gamma =  alpha*beta #nxT
         gamma /= np.sum(gamma,axis=0)
         
         expected_mu = np.zeros((self.n_dims, self.n_states))
         expected_covs = np.zeros((self.n_dims, self.n_dims, self.n_states))
-        
+
         gamma_state_sum = np.sum(gamma, axis=1)
         #Set zeros to 1 before dividing
         gamma_state_sum = gamma_state_sum + (gamma_state_sum == 0)
         
-        gamma_old_sum = np.sum(gamma_old[obs.shape[1]:], axis=1)
+        gamma_old_sum = np.sum(gamma_old[:,obs.shape[1]:], axis=1)
+        gamma_old_sum = gamma_old_sum + (gamma_old_sum == 0)
         
         xi = np.zeros([self.n_states,self.n_states])
-        for t in range(obs.shape[1]):
-            if (t==0):
-                partial_sum =  self.A * np.dot(alpha_old, (beta[:, t] * B[:, t]).T)
-                xi += self._norm(partial_sum)
-            else:
-                partial_sum = self.A * np.dot(alpha[:, t], (beta[:, t] * B[:, t]).T)
-                xi += self._norm(partial_sum)
+        for t in range(obs.shape[1]-1):
+            partial_sum = self.A * np.dot(alpha[:, t], (beta[:, t] * B[:, t+1]).T)
+            xi += self._norm(partial_sum)
                 
         for s in range(self.n_states):
             gamma_obs = obs * gamma[s, :] #1xT
@@ -169,16 +185,19 @@ class gmmhmm:
             partial_covs = np.dot(gamma_obs, obs.T) / gamma_state_sum[s] - np.dot(expected_mu[:, s], expected_mu[:, s].T)
             #Symmetrize
             expected_covs[:,:,s] = np.triu(partial_covs) + np.triu(partial_covs).T - np.diag(partial_covs)
-        
         self.A = self.A*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + self._rownorm((xi.T/(gamma_old_sum+gamma_state_sum)).T)
-        self.mu = self.mu*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + expected_mu/(gamma_old_sum+gamma_state_sum)
-        self.covs = self.covs*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + expected_covs/(gamma_old_sum+gamma_state_sum)[:,None]
         
-        return(np.concatenate((gamma_old[:,gamma.shape[1]:],gamma),axis=1))
+        #Gotta fix mu and covs
+        self.mu = self.mu*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + expected_mu*(1-(gamma_old_sum/(gamma_state_sum+gamma_old_sum)))
+        self.covs = self.covs*(gamma_old_sum/(gamma_state_sum+gamma_old_sum)) + expected_covs*(1-(gamma_old_sum/(gamma_state_sum+gamma_old_sum)))
+        self.A = self._rownorm(self.A)
+        self.covs += .001 * np.eye(self.n_dims)[:, :, None]
+            
+        return(alpha[:,-1], beta[:,-1],np.concatenate((gamma_old[:,gamma.shape[1]:],gamma),axis=1))
         
         
 #Set seed
-np.random.seed(seed=123)
+np.random.seed(seed=12345)
 
 #Generating data from a 2 state, 2 observation HMM
 #A = [0.7, 0.3; 0.3, 0.7]
@@ -186,8 +205,8 @@ np.random.seed(seed=123)
 #covs = [0.5,0.5]
 #Pi = [0.5, 0.5]
 
-X = np.zeros(2000)
-Y = np.zeros(2000)
+X = np.zeros(100000)
+Y = np.zeros(100000)
 if st.uniform.rvs(size=1)[0] >= 0.5:
     X[0] = 1
     
@@ -196,14 +215,14 @@ for i in range(X.shape[0]):
 
     if X[i] == 0:
         Y[i] = np.random.normal(-1,0.5)
-        if i < 1999:
+        if i < 99999:
             if p1 > 0.7:
                 X[i+1] = 1              
     else:
         Y[i] = np.random.normal(1,0.5)
-        if i < 1999:
+        if i < 99999:
             if p1 > 0.7:
                 X[i+1] = 0
 
 test_hmm = gmmhmm(2)
-test_hmm.train(Y, A =np.array([[0.8,0.2],[0.2,0.8]]), mu = np.array([[-1,1]]), covs=np.array([[[0.5,0.5]]]), n_iter = 100)
+test_hmm.train(Y, A =np.array([[0.7,0.3],[0.3,0.7]]), mu = np.array([[-1,1]]), covs=np.array([[[0.5,0.5]]]), n_iter = 100, method='slide')
